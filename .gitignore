@@ -1,0 +1,11 @@
+cat > .gitignore << 'EOF'
+__pycache__/
+*.pyc
+*.egg-info/
+.ipynb_checkpoints/
+build/
+dist/
+.venv/
+fort.99
+tracks_log.txt
+EOF
