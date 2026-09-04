@@ -4,31 +4,24 @@ import pandas as pd
 VALID_OPS = {'greater', 'less', 'greater_equal', 'less_equal', 'equal', 'not_equal'}
 VALID_STATS = {'max', 'min', 'median', 'mean'}
 
-def create_mask(column, op, val):
-    """
-    Build (and validate) a single mask condition tuple: (column, op, val).
-    Purely a convenience/validation wrapper -- users can just write the
-    tuple by hand if they prefer.
-
-    Example
-    -------
-    create_mask('mass_1', 'greater', 5)  -> ('mass_1', 'greater', 5)
-    """
-    if op not in VALID_OPS:
-        raise ValueError(f"Unsupported operation '{op}'. Must be one of {sorted(VALID_OPS)}")
-    return (column, op, val)
-
 
 def build_mask(events, mask_list, mask_logic='and'):
     """
     Combine a list of (column, op, val) conditions into a single boolean mask
     over `events`, using exact column names (no renaming/stripping).
+
+    mask_list : list of (column, op, val) tuples, e.g. ('mass_1', 'greater', 5)
+    mask_logic : 'and' or 'or'
+
+    Users can call this directly, or build their own boolean array/Series
+    by hand (e.g. combining conditions with arbitrary logic) and pass that
+    straight into get_events -- build_mask is just a convenience for the
+    common tuple-list case.
     """
     if mask_logic not in ('and', 'or'):
         raise ValueError("mask_logic must be 'and' or 'or'")
 
     if not mask_list:
-        # no conditions -> everything passes ('and') 
         return np.ones(len(events), dtype=bool)
 
     mask = np.ones(len(events), dtype=bool) if mask_logic == 'and' else np.zeros(len(events), dtype=bool)
@@ -36,6 +29,9 @@ def build_mask(events, mask_list, mask_logic='and'):
     for col, op, val in mask_list:
         if col not in events.columns:
             raise KeyError(f"Column '{col}' not found in events dataframe")
+
+        if op not in VALID_OPS:
+            raise ValueError(f"Unsupported operation '{op}'. Must be one of {VALID_OPS}")
 
         if op == 'greater':
             cond = events[col] > val
@@ -54,18 +50,35 @@ def build_mask(events, mask_list, mask_logic='and'):
 
         mask = (mask & cond) if mask_logic == 'and' else (mask | cond)
 
-    return mask
+    return np.asarray(mask)
 
 
-def _summarize_block(block, stat_columns, stats):
+def _validate_stats_dict(stats_dict, available_columns):
+    """Check that a colname -> [stats] dict only references known columns/stats."""
+    if not stats_dict:
+        return {}
+
+    missing_cols = set(stats_dict) - set(available_columns)
+    if missing_cols:
+        raise KeyError(f"Columns not found in bcm: {sorted(missing_cols)}")
+
+    for col, stat_list in stats_dict.items():
+        invalid = set(stat_list) - VALID_STATS
+        if invalid:
+            raise ValueError(f"Unsupported stats {invalid} for column '{col}'. Must be from {VALID_STATS}")
+
+    return stats_dict
+
+
+def _summarize_block(block, stats_dict):
     """Build one interval record: start/end time plus requested column stats."""
     record = {
         'tphys_start': float(block['tphys'].iloc[0]),
         'tphys_end': float(block['tphys'].iloc[-1]),
     }
-    for col in stat_columns:
+    for col, stat_list in stats_dict.items():
         values = block[col]
-        for stat in stats:
+        for stat in stat_list:
             if stat == 'max':
                 record[f'{col}_max'] = float(values.max())
             elif stat == 'min':
@@ -77,20 +90,19 @@ def _summarize_block(block, stat_columns, stats):
     return record
 
 
-def intervals_for_bin_num(events, mask_list, mask_logic='and', stat_columns=None, stats=None):
+def intervals_for_bin_num(group, stats_dict=None):
     """
-    Find contiguous stretches (in sorted tphys order) where the mask holds,
-    for a single binary system. Returns a list of interval dicts.
+    Find contiguous stretches (in sorted tphys order) where group['_mask']
+    is True, for a single binary system. group must already contain a
+    boolean '_mask' column. Returns a list of interval dicts.
     """
-    if len(events) == 0:
+    if len(group) == 0:
         return []
 
-    stat_columns = stat_columns or []
-    stats = stats or []
+    stats_dict = stats_dict or {}
 
-    events = events.sort_values('tphys').reset_index(drop=True)
-    mask = build_mask(events, mask_list, mask_logic=mask_logic)
-    selected_positions = np.flatnonzero(mask)
+    group = group.sort_values('tphys').reset_index(drop=True)
+    selected_positions = np.flatnonzero(group['_mask'].to_numpy())
 
     if len(selected_positions) == 0:
         return []
@@ -101,50 +113,48 @@ def intervals_for_bin_num(events, mask_list, mask_logic='and', stat_columns=None
 
     for pos in selected_positions[1:]:
         if pos != prev_pos + 1:
-            block = events.iloc[start_pos:prev_pos + 1]
-            intervals.append(_summarize_block(block, stat_columns, stats))
+            block = group.iloc[start_pos:prev_pos + 1]
+            intervals.append(_summarize_block(block, stats_dict))
             start_pos = pos
         prev_pos = pos
 
-    block = events.iloc[start_pos:prev_pos + 1]
-    intervals.append(_summarize_block(block, stat_columns, stats))
+    block = group.iloc[start_pos:prev_pos + 1]
+    intervals.append(_summarize_block(block, stats_dict))
 
     return intervals
 
 
-def intervals_for_star(bcm, star, mask_list, mask_logic='and', stats=None):
+def intervals_for_star(bcm, star, mask, stats_dict=None):
     """
     Compute intervals for one star (1 or 2) across every binary in bcm.
-    mask_list must use exact bcm column names (e.g. 'mass_1', 'kstar_2').
-    `star` is just the label attached to output rows -- it does not force
-    mask_list to reference _1 or _2 columns, so use it deliberately.
+
+    mask       : boolean array/Series, same length as bcm, aligned by
+                 position (e.g. the output of build_mask(bcm, ...), or any
+                 boolean array/Series the user constructs themselves).
+    star       : label (1 or 2) attached to output rows.
+    stats_dict : dict of {column: [stat, ...]} -- exact bcm column names,
+                 e.g. {'teff_1': ['min', 'max'], 'lum_1': ['mean']}.
     """
     if star not in (1, 2):
         raise ValueError('star must be 1 or 2')
-    if not mask_list:
-        return []
 
-    stats = stats or []
+    mask = np.asarray(mask)
+    if len(mask) != len(bcm):
+        raise ValueError(f"mask length ({len(mask)}) does not match bcm length ({len(bcm)})")
 
-    # every column referenced in the mask gets its own summary stats
-    stat_columns = sorted({col for col, _, _ in mask_list})
+    stats_dict = _validate_stats_dict(stats_dict, bcm.columns)
 
-    required_cols = set(stat_columns) | {'tphys', 'bin_num'}
+    required_cols = set(stats_dict) | {'tphys', 'bin_num'}
     missing = required_cols - set(bcm.columns)
     if missing:
         raise KeyError(f"Columns not found in bcm: {sorted(missing)}")
 
     events = bcm[list(required_cols)].copy()
+    events['_mask'] = mask
 
     results = []
     for bin_num, group in events.groupby('bin_num', sort=False):
-        intervals = intervals_for_bin_num(
-            group,
-            mask_list=mask_list,
-            mask_logic=mask_logic,
-            stat_columns=stat_columns,
-            stats=stats,
-        )
+        intervals = intervals_for_bin_num(group, stats_dict=stats_dict)
         for interval in intervals:
             results.append({'bin_num': bin_num, 'star': star, **interval})
 
@@ -152,39 +162,42 @@ def intervals_for_star(bcm, star, mask_list, mask_logic='and', stats=None):
 
 
 def get_events(bcm, primary_mask=None, secondary_mask=None,
-                primary_logic='and', secondary_logic='and',
-                stats=None):
+                primary_stats=None, secondary_stats=None):
     """
-    User-facing entry point.
+    Generate an event dataframe with intervals for each star and optional statistics.
 
-    primary_mask   : list of (column, op, val) -- defines event windows for star 1.
-    secondary_mask : list of (column, op, val) -- defines event windows for star 2.
-                     (Either can be None/[] to skip that star entirely.)
-    stats          : optional subset of ['max', 'min', 'median', 'mean'].
-                      Duplicates are silently ignored. When given, adds
-                      <col>_<stat> columns for every column referenced in
-                      the mask that produced each row.
+    Parameters
+    ----------
+    primary_mask: pd.Series
+        boolean series -- same length as bcm -- defines
+        event windows for star 1. Build with build_mask(...)
+        or construct by hand for arbitrary custom logic.
+        None/omitted to skip star 1.
+    secondary_mask: pd.Series
+        Same as primary_mask, but for star 2. None/omitted
+        to skip star 2.
+    primary_stats: dict
+        Dictionary of {column: [stat, ...]} for star 1 intervals,
+        e.g. {'teff_1': ['min', 'max'], 'lum_1': ['mean']}.
+        stat options: 'max', 'min', 'median', 'mean'.
+    secondary_stats : dict
+        Same as primary_stats for star 2 intervals, e.g. {'teff_2': [...]}.
 
     Returns
     -------
-    pd.DataFrame with columns: bin_num, star, tphys_start, tphys_end,
-    plus any requested <col>_<stat> columns.
+    event_df: pd.DataFrame
+        Event dataframe with columns: bin_num, star, tphys_start, tphys_end,
+        plus any stats dict columns in the format *colname*_*stat*.
     """
-    if stats:
-        invalid = set(stats) - VALID_STATS
-        if invalid:
-            raise ValueError(f"Unsupported stats {invalid}. Must be from {VALID_STATS}")
-        stats = list(dict.fromkeys(stats))  # de-dupe, keep order
-    else:
-        stats = []
-
     records = []
-    if primary_mask:
-        records.extend(intervals_for_star(bcm, star=1, mask_list=primary_mask,
-                                           mask_logic=primary_logic, stats=stats))
-    if secondary_mask:
-        records.extend(intervals_for_star(bcm, star=2, mask_list=secondary_mask,
-                                           mask_logic=secondary_logic, stats=stats))
+    if primary_mask is not None:
+        records.extend(intervals_for_star(
+            bcm, star=1, mask=primary_mask, stats_dict=primary_stats,
+        ))
+    if secondary_mask is not None:
+        records.extend(intervals_for_star(
+            bcm, star=2, mask=secondary_mask, stats_dict=secondary_stats,
+        ))
 
     base_cols = ['bin_num', 'star', 'tphys_start', 'tphys_end']
     if not records:
