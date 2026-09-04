@@ -75,6 +75,7 @@ def _summarize_block(block, stats_dict):
     record = {
         'tphys_start': float(block['tphys'].iloc[0]),
         'tphys_end': float(block['tphys'].iloc[-1]),
+        'duration': float(block['tphys'].iloc[-1] - block['tphys'].iloc[0]),
     }
     for col, stat_list in stats_dict.items():
         values = block[col]
@@ -160,9 +161,122 @@ def _intervals_for_star(bcm, star, mask, stats_dict=None):
 
     return results
 
+def add_interaction_info(events, bpp, bcm, no_merger_value='-001'):
+    """
+    Augment an events dataframe (bin_num, star, tphys_start, tphys_end, ...)
+    with pre-/during-event interaction and merger history, computed per row
+    using that row's star (1 or 2) and its companion.
+
+    Adds
+    ----
+    pre_event_interactions       : 'None' | 'RLOF' | 'CEE'
+    during_event_interactions    : 'None' | 'RLOF' | 'CEE'
+    pre_event_merger             : bool
+    during_event_merger          : bool  (False if pre_event_merger is True)
+    pre_event_merger_type        : str -- the merger_type value if merged pre-event, else 'None'
+    during_event_merger_type     : str -- the merger_type value if merged during event, else 'None'
+                                    (always 'None' if pre_event_merger is True)
+    pre_event_donor_kstars       : str (e.g. '1-3-5') or 'None'
+    pre_event_accretor_kstars    : str or 'None'
+    during_event_donor_kstars    : str or 'None'
+    during_event_accretor_kstars : str or 'None'
+
+    Notes
+    -----
+    - 'merger' is read off bcm's merger_type column: any value != no_merger_value
+      ('-001' by default) counts as merged.
+    - CEE takes precedence over RLOF if a window contains both (matches the
+      original convention: any evol_type==7 -> 'CEE', else evol_type==3 -> 'RLOF').
+    """
+    events = events.copy()
+
+    bin_nums = events['bin_num'].unique()
+    bpp = bpp[bpp['bin_num'].isin(bin_nums)]
+    bcm = bcm[bcm['bin_num'].isin(bin_nums)]
+
+    bpp_groups = {bin_num: group for bin_num, group in bpp.groupby('bin_num')}
+    bcm_groups = {bin_num: group for bin_num, group in bcm.groupby('bin_num')}
+
+    def interaction_label(sub_bpp):
+        if sub_bpp.empty:
+            return 'None'
+        types = set(sub_bpp['evol_type'])
+        if 7 in types:
+            return 'CEE'
+        if 3 in types:
+            return 'RLOF'
+        return 'None'
+
+    def kstar_list(sub_bpp, kstar_col):
+        if sub_bpp.empty:
+            return 'None'
+        vals = sorted(sub_bpp[kstar_col].unique())
+        return '-'.join(map(str, vals)) if vals else 'None'
+
+    def merger_type_value(sub_bcm):
+        """First non-default merger_type in the window, or 'None' if none merged."""
+        merged_rows = sub_bcm[sub_bcm['merger_type'] != no_merger_value]
+        if merged_rows.empty:
+            return 'None'
+        return merged_rows['merger_type'].iloc[0]
+
+    records = []
+    for _, row in events.iterrows():
+        bin_num, star = row['bin_num'], int(row['star'])
+        companion = 2 if star == 1 else 1
+
+        kstar_col = f'kstar_{star}'
+        rrlo_col = f'RRLO_{star}'
+        rrlo_companion_col = f'RRLO_{companion}'
+
+        bpp_bin = bpp_groups.get(bin_num, bpp.iloc[0:0])
+        bcm_bin = bcm_groups.get(bin_num, bcm.iloc[0:0])
+
+        pre_bpp = bpp_bin[bpp_bin['tphys'] < row['tphys_start']]
+        during_bpp = bpp_bin[(bpp_bin['tphys'] >= row['tphys_start']) &
+                              (bpp_bin['tphys'] <= row['tphys_end'])]
+
+        pre_interactions = interaction_label(pre_bpp[pre_bpp['evol_type'].isin([3, 7])])
+        during_interactions = interaction_label(during_bpp[during_bpp['evol_type'].isin([3, 7])])
+
+        pre_donor_kstars = kstar_list(pre_bpp[pre_bpp[rrlo_col] > 1], kstar_col)
+        pre_accretor_kstars = kstar_list(pre_bpp[pre_bpp[rrlo_companion_col] > 1], kstar_col)
+        during_donor_kstars = kstar_list(during_bpp[during_bpp[rrlo_col] > 1], kstar_col)
+        during_accretor_kstars = kstar_list(during_bpp[during_bpp[rrlo_companion_col] > 1], kstar_col)
+
+        pre_bcm = bcm_bin[bcm_bin['tphys'] < row['tphys_start']]
+        during_bcm = bcm_bin[(bcm_bin['tphys'] >= row['tphys_start']) &
+                              (bcm_bin['tphys'] <= row['tphys_end'])]
+
+        pre_merger_type = merger_type_value(pre_bcm)
+        pre_merger = pre_merger_type != 'None'
+
+        if pre_merger:
+            during_merger_type = 'None'
+            during_merger = False
+        else:
+            during_merger_type = merger_type_value(during_bcm)
+            during_merger = during_merger_type != 'None'
+
+        records.append({
+            'pre_event_interactions': pre_interactions,
+            'during_event_interactions': during_interactions,
+            'pre_event_merger': pre_merger,
+            'during_event_merger': during_merger,
+            'pre_event_merger_type': pre_merger_type,
+            'during_event_merger_type': during_merger_type,
+            'pre_event_donor_kstars': pre_donor_kstars,
+            'pre_event_accretor_kstars': pre_accretor_kstars,
+            'during_event_donor_kstars': during_donor_kstars,
+            'during_event_accretor_kstars': during_accretor_kstars,
+        })
+
+    info_df = pd.DataFrame(records, index=events.index)
+    return pd.concat([events, info_df], axis=1)
 
 def get_events(bcm, primary_mask=None, secondary_mask=None,
-                primary_stats=None, secondary_stats=None):
+                primary_stats=None, secondary_stats=None,
+                include_interaction_info=False, bpp=None):
     """
     Generate an event dataframe with intervals for each star and optional statistics.
 
@@ -199,12 +313,18 @@ def get_events(bcm, primary_mask=None, secondary_mask=None,
             bcm, star=2, mask=secondary_mask, stats_dict=secondary_stats,
         ))
 
-    base_cols = ['bin_num', 'star', 'tphys_start', 'tphys_end']
+    base_cols = ['bin_num', 'star', 'tphys_start', 'tphys_end', 'duration']
     if not records:
         return pd.DataFrame(columns=base_cols)
 
     df = pd.DataFrame(records)
     other_cols = sorted(c for c in df.columns if c not in base_cols)
     df = df[base_cols + other_cols]
+    df = df.sort_values(['bin_num', 'star', 'tphys_start']).reset_index(drop=True)
 
-    return df.sort_values(['bin_num', 'star', 'tphys_start']).reset_index(drop=True)
+    if include_interaction_info:
+        if bpp is None:
+            raise ValueError("bpp must be provided if include_interaction_info is True")
+        df = add_interaction_info(df, bpp, bcm)
+
+    return df
