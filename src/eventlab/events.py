@@ -90,7 +90,7 @@ def _summarize_block(block, stats_dict):
     return record
 
 
-def intervals_for_bin_num(group, stats_dict=None):
+def _intervals_for_bin_num(group, stats_dict=None):
     """
     Find contiguous stretches (in sorted tphys order) where group['_mask']
     is True, for a single binary system. group must already contain a
@@ -124,7 +124,7 @@ def intervals_for_bin_num(group, stats_dict=None):
     return intervals
 
 
-def intervals_for_star(bcm, star, mask, stats_dict=None):
+def _intervals_for_star(bcm, star, mask, stats_dict=None):
     """
     Compute intervals for one star (1 or 2) across every binary in bcm.
 
@@ -154,7 +154,7 @@ def intervals_for_star(bcm, star, mask, stats_dict=None):
 
     results = []
     for bin_num, group in events.groupby('bin_num', sort=False):
-        intervals = intervals_for_bin_num(group, stats_dict=stats_dict)
+        intervals = _intervals_for_bin_num(group, stats_dict=stats_dict)
         for interval in intervals:
             results.append({'bin_num': bin_num, 'star': star, **interval})
 
@@ -191,11 +191,11 @@ def get_events(bcm, primary_mask=None, secondary_mask=None,
     """
     records = []
     if primary_mask is not None:
-        records.extend(intervals_for_star(
+        records.extend(_intervals_for_star(
             bcm, star=1, mask=primary_mask, stats_dict=primary_stats,
         ))
     if secondary_mask is not None:
-        records.extend(intervals_for_star(
+        records.extend(_intervals_for_star(
             bcm, star=2, mask=secondary_mask, stats_dict=secondary_stats,
         ))
 

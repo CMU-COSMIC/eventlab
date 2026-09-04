@@ -1,6 +1,6 @@
 # eventlab
 
-A small toolkit to build event catalogs and DTDs from COSMIC output
+A small toolkit to build event catalogs and delay time distributions (DTDs) from COSMIC output
 
 ## Install
 
@@ -10,8 +10,12 @@ pip install .
 
 ## Contents
 
-- `eventlab.events` - define events with user provided boolean conditions over `bcm` (or `bcm`-like) columns and extract contiguous time intervals per binary/star where the mask holds (`build_mask`, `get_events`).
+- `eventlab.events` - Define events over a `bcm` (or `bcm`-like) dataframe via a boolean mask created with the helper `build_mask` or your own custom mask. Extract contiguous time intervals per binary/star where the mask holds and select summary statistics to report on columns of interest during the events with `get_events`.
 
-- `eventlab.dtd` - bin those intervals into a DTD, correctly splitting duration across bin edges and weighting by bin size and population mass (`get_event_bin_counts`).
+- `eventlab.dtd` - Properly bin those event intervals into a delay time distribution (DTD) with `get_event_bin_counts`. Intervals that span bins are split and their duration in each bin is treated independently. DTD power with units of $M_\odot^{-1}$ in bin i ($\Psi_i$) is defined as: 
 
-- `demo/` - example notebooks showing usage end-to-end.
+$$
+\Psi_i = \sum_{\text{events} \in \text{bin } i} \frac{\text{event duration}}{\text{duration of bin } i \times M_{\text{sample}}}
+$$
+
+- `demo/` - Example notebooks showing usage end-to-end.
